@@ -3,6 +3,7 @@ using HotChocolate.Authorization;
 using Mediator;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using PiedraAzul.Application.Common.Interfaces;
 using static PiedraAzul.Application.Common.Interfaces.OtpChannel;
@@ -19,6 +20,8 @@ using PiedraAzul.Application.Features.Users.Commands.CreateProfileForRole;
 using PiedraAzul.GraphQL.Inputs;
 using PiedraAzul.GraphQL.Types;
 using PiedraAzul.Infrastructure.Identity;
+using PiedraAzul.Infrastructure.Persistence;
+using PiedraAzul.Domain.Repositories;
 using System.Security.Claims;
 
 namespace PiedraAzul.GraphQL;
@@ -162,9 +165,100 @@ public class Mutation
 
     public async Task<bool> SaveScheduleConfigAsync(
         ScheduleConfigInput input,
-        [Service] IMediator mediator)
+        [Service] ISystemConfigRepository systemConfigRepository,
+        [Service] IDoctorAvailabilitySlotRepository slotRepository,
+        [Service] AppDbContext dbContext,
+        [Service] IUnitOfWork unitOfWork)
     {
-      throw new NotImplementedException("SaveScheduleConfigAsync is not implemented yet.");
+        if (input is null)
+            throw new GraphQLException("La configuración es requerida");
+
+        if (string.IsNullOrWhiteSpace(input.DoctorId))
+            throw new GraphQLException("DoctorId es requerido");
+
+        if (input.BookingWindowWeeks < 1)
+            throw new GraphQLException("BookingWindowWeeks debe ser mayor a 0");
+
+        if (input.IntervalMinutes <= 0)
+            throw new GraphQLException("IntervalMinutes debe ser mayor a 0");
+
+        var availability = input.Availability ?? [];
+
+        foreach (var day in availability.Where(x => x.IsEnabled))
+        {
+            if (day.StartTime >= day.EndTime)
+                throw new GraphQLException($"Rango inválido para {day.DayOfWeek}: StartTime debe ser menor que EndTime");
+        }
+
+        await unitOfWork.ExecuteAsync(async ct =>
+        {
+            var config = await systemConfigRepository.GetOrCreateAsync(ct);
+            config.UpdateBookingWindowWeeks(input.BookingWindowWeeks);
+            await systemConfigRepository.SaveAsync(config, ct);
+
+            var desired = new HashSet<(DayOfWeek Day, TimeSpan Start, TimeSpan End)>();
+            foreach (var day in availability.Where(x => x.IsEnabled))
+            {
+                var start = day.StartTime;
+                while (start < day.EndTime)
+                {
+                    var end = start.Add(TimeSpan.FromMinutes(input.IntervalMinutes));
+                    if (end > day.EndTime)
+                        break;
+
+                    desired.Add((day.DayOfWeek, start, end));
+                    start = end;
+                }
+            }
+
+            var existing = await slotRepository.ListByDoctorAsync(input.DoctorId, ct);
+            var existingSet = existing
+                .Select(s => (s.DayOfWeek, s.StartTime, s.EndTime))
+                .ToHashSet();
+
+            foreach (var slot in existing)
+            {
+                var keep = desired.Contains((slot.DayOfWeek, slot.StartTime, slot.EndTime));
+                if (keep)
+                    continue;
+
+                var hasAppointments = await dbContext.Appointments
+                    .AnyAsync(a => a.DoctorAvailabilitySlotId == slot.Id, ct);
+
+                if (!hasAppointments)
+                    await slotRepository.DeleteAsync(slot.Id, ct);
+            }
+
+            foreach (var item in desired)
+            {
+                if (existingSet.Contains(item))
+                    continue;
+
+                await slotRepository.AddAsync(new Domain.Entities.Profiles.Doctor.DoctorAvailabilitySlot(
+                    input.DoctorId,
+                    item.Day,
+                    item.Start,
+                    item.End), ct);
+            }
+
+            return true;
+        });
+
+        return true;
+    }
+
+    public async Task<bool> UpdateBookingWindowWeeksAsync(
+        int bookingWindowWeeks,
+        [Service] ISystemConfigRepository systemConfigRepository)
+    {
+        if (bookingWindowWeeks < 1)
+            throw new GraphQLException("bookingWindowWeeks debe ser mayor o igual a 1");
+
+        var config = await systemConfigRepository.GetOrCreateAsync();
+        config.UpdateBookingWindowWeeks(bookingWindowWeeks);
+        await systemConfigRepository.SaveAsync(config);
+
+        return true;
     }
     public async Task<bool> RequestPasswordResetAsync(
         RequestPasswordResetInput input,
