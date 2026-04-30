@@ -84,9 +84,38 @@ public class Query
 
     public async Task<ScheduleConfigType> GetScheduleConfigByDoctorIdAsync(
         string doctorId,
-        [Service] IMediator mediator)
+        [Service] ISystemConfigRepository systemConfigRepository,
+        [Service] IDoctorAvailabilitySlotRepository slotRepository)
     {
-        throw new NotImplementedException("GetScheduleConfigByDoctorIdAsync is not implemented yet");
+        if (string.IsNullOrWhiteSpace(doctorId))
+            throw new GraphQLException("doctorId es requerido");
+
+        var config = await systemConfigRepository.GetOrCreateAsync();
+        var slots = await slotRepository.ListByDoctorAsync(doctorId);
+
+        var availability = Enum.GetValues<DayOfWeek>()
+            .Select(day =>
+            {
+                var daySlots = slots.Where(s => s.DayOfWeek == day).OrderBy(s => s.StartTime).ToList();
+                return new ScheduleDayType
+                {
+                    DayOfWeek = day,
+                    IsEnabled = daySlots.Count > 0,
+                    StartTime = daySlots.Count > 0 ? daySlots.First().StartTime : TimeSpan.Zero,
+                    EndTime = daySlots.Count > 0 ? daySlots.Last().EndTime : TimeSpan.Zero
+                };
+            })
+            .ToList();
+
+        return new ScheduleConfigType
+        {
+            DoctorId = doctorId,
+            BookingWindowWeeks = config.BookingWindowWeeks,
+            IntervalMinutes = slots.Count > 1
+                ? (int)Math.Max(1, (slots.OrderBy(s => s.StartTime).Skip(1).First().StartTime - slots.OrderBy(s => s.StartTime).First().StartTime).TotalMinutes)
+                : 15,
+            Availability = availability
+        };
     }
 
     [Authorize]

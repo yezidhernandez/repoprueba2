@@ -163,7 +163,9 @@ public class Mutation
 
     public async Task<bool> SaveScheduleConfigAsync(
         ScheduleConfigInput input,
-        [Service] IMediator mediator)
+        [Service] ISystemConfigRepository systemConfigRepository,
+        [Service] IDoctorAvailabilitySlotRepository slotRepository,
+        [Service] IUnitOfWork unitOfWork)
     {
         if (input is null)
             throw new GraphQLException("La configuración es requerida");
@@ -177,16 +179,47 @@ public class Mutation
         if (input.IntervalMinutes <= 0)
             throw new GraphQLException("IntervalMinutes debe ser mayor a 0");
 
-        if (input.Availability is null || input.Availability.Count == 0)
-            throw new GraphQLException("Debe enviar al menos un día de disponibilidad");
+        var availability = input.Availability ?? [];
 
-        foreach (var day in input.Availability.Where(x => x.IsEnabled))
+        foreach (var day in availability.Where(x => x.IsEnabled))
         {
             if (day.StartTime >= day.EndTime)
                 throw new GraphQLException($"Rango inválido para {day.DayOfWeek}: StartTime debe ser menor que EndTime");
         }
 
-        throw new GraphQLException("SaveScheduleConfigAsync pendiente de integración con capa Application/Repository");
+        await unitOfWork.ExecuteAsync(async ct =>
+        {
+            var config = await systemConfigRepository.GetOrCreateAsync(ct);
+            config.UpdateBookingWindowWeeks(input.BookingWindowWeeks);
+            await systemConfigRepository.SaveAsync(config, ct);
+
+            var existing = await slotRepository.ListByDoctorAsync(input.DoctorId, ct);
+            foreach (var slot in existing)
+                await slotRepository.DeleteAsync(slot.Id, ct);
+
+            foreach (var day in availability.Where(x => x.IsEnabled))
+            {
+                var start = day.StartTime;
+                while (start < day.EndTime)
+                {
+                    var end = start.Add(TimeSpan.FromMinutes(input.IntervalMinutes));
+                    if (end > day.EndTime)
+                        break;
+
+                    await slotRepository.AddAsync(new Domain.Entities.Profiles.Doctor.DoctorAvailabilitySlot(
+                        input.DoctorId,
+                        day.DayOfWeek,
+                        start,
+                        end), ct);
+
+                    start = end;
+                }
+            }
+
+            return true;
+        });
+
+        return true;
     }
 
     public async Task<bool> UpdateBookingWindowWeeksAsync(
